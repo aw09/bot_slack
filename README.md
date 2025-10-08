@@ -9,6 +9,7 @@ Bot Slack yang menganalisis thread dan menyimpan data ke Google Spreadsheet meng
 - 🔍 Mengekstrak type, description, sentiment, dan urgency dari thread
 - 📝 Mendukung perintah sederhana dalam Bahasa Indonesia
 - 🔗 Menyimpan permalink thread untuk referensi
+- ✅ Membuat task otomatis di Slack List untuk tindak lanjut PQF/Bug
 
 ## Setup
 
@@ -36,6 +37,7 @@ pip install -r requirements.txt
    - `users:read.email`
    - `channels:join`
    - `channels:read`
+   - `slacklists:write` *(untuk membuat item Lists)*
 4. Install aplikasi ke workspace Slack Anda
 
 ### 3. Konfigurasi Google Sheets
@@ -68,6 +70,25 @@ SHEET_NAME=Thread Analysis
 
 # Gemini AI Configuration
 GEMINI_API_KEY=your-gemini-api-key-here
+
+# Slack List Integration (Optional)
+SLACK_LIST_ID=F1234ABCD
+SLACK_LIST_COLUMN_NAMES={"title":"Title","link":"Thread Link","status":"Status","description":"Description","product":"Product","reporter":"Reporter"}
+# Atau simpan mapping di file JSON dan tunjukkan lokasinya
+# SLACK_LIST_COLUMN_NAMES_FILE=./config/slack_list_columns.json
+
+# Status default berdasarkan label yang muncul di Slack List
+SLACK_LIST_DEFAULT_STATUS_NAME=New
+SLACK_LIST_PQF_STATUS_NAME=New
+SLACK_LIST_LINK_DISPLAY_NAME=Slack Thread
+
+# (Opsional) Fallback legacy jika ingin menyetel ID kolom secara manual
+# SLACK_LIST_TITLE_COLUMN_ID=ColTitle123
+# SLACK_LIST_DESCRIPTION_COLUMN_ID=ColDesc123
+# ... dan seterusnya
+# SLACK_LIST_STATUS_OPTIONS={"New":"OptNew123","In Progress":"OptInProgress123"}
+
+Bot akan mencoba mendeteksi kolom Slack List secara otomatis berdasarkan nama kolom (`Title`, `Status`, `Product`, dll). Bila nama kolom workspace berbeda, set `SLACK_LIST_COLUMN_NAMES` (atau file JSON) dengan `key -> display name` agar mappingnya tepat. Legacy environment variables masih didukung untuk kompatibilitas dan menjadi fallback jika auto-detect gagal (misalnya tidak mempunyai izin membaca schema List).
 
 ### 6. Konfigurasi ngrok (Opsional untuk Development)
 

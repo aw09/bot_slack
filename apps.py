@@ -6,6 +6,7 @@ from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
 import json
 import re
+import textwrap
 import threading
 import time
 import traceback
@@ -40,6 +41,141 @@ spreadsheet_manager = SpreadsheetManager()
 executor = ThreadPoolExecutor(max_workers=2)  # Bisa disesuaikan sesuai kebutuhan
 
 ALLOWED_CHANNELS = os.getenv('ALLOWED_CHANNELS', '').split(',')
+WORKFLOW_BRACKET_FIELD_ORDER = [
+    field.strip()
+    for field in os.getenv('SLACK_WORKFLOW_BRACKET_FIELD_ORDER', 'date_of_incident,category,product').split(',')
+    if field.strip()
+]
+def extract_workflow_form_data(message):
+    payload = {}
+    if not message:
+        return payload
+
+    text = message.get('text') or ''
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    for line in lines:
+        bracket_values = re.findall(r'\[([^\]]+)\]', line)
+        if bracket_values:
+            for idx, value in enumerate(bracket_values):
+                if idx < len(WORKFLOW_BRACKET_FIELD_ORDER):
+                    key = WORKFLOW_BRACKET_FIELD_ORDER[idx]
+                    payload[key] = value.strip()
+            continue
+
+        clean_line = re.sub(r'<@[^>]+>', '', line).strip()
+        colon_match = re.match(r'(?i)(title|description|date(?: of incident)?|feature|product|category)\s*:\s*(.+)', clean_line)
+        if colon_match:
+            key = colon_match.group(1).lower()
+            value = colon_match.group(2).strip()
+            if key.startswith('date'):
+                payload['date_of_incident'] = value
+            elif key == 'title':
+                payload['title'] = value
+            elif key == 'description':
+                payload['description'] = value
+            else:
+                payload[key] = value
+            continue
+
+        if clean_line.lower().startswith('report by'):
+            payload['reporter_display'] = clean_line.split(':', 1)[-1].strip()
+
+    files = message.get('files') or []
+    attachment_ids = []
+    for file_data in files:
+        file_id = file_data.get('id')
+        if file_id:
+            attachment_ids.append(file_id)
+    if attachment_ids:
+        payload['attachments'] = attachment_ids
+
+    return payload
+
+
+def _shorten_text(text, width=400):
+    if text is None:
+        return ''
+    text = str(text).strip()
+    if not text:
+        return ''
+    if len(text) <= width:
+        return text
+    try:
+        return textwrap.shorten(text, width=width, placeholder='…')
+    except Exception:
+        return text[:width - 1] + '…'
+
+
+def create_slack_list_item_from_row(row_data, analysis, sheet_name, quarter=None, year=None, week_num=None, permalink=None, channel=None, form_payload=None):
+    """Create a Slack List task mirroring the PQF spreadsheet entry."""
+    if not getattr(slack_bot, 'slack_list_enabled', False):
+        return
+    try:
+        analysis = analysis or {}
+        form_payload = form_payload or {}
+        product_raw = form_payload.get('product') or analysis.get('product') or row_data.get('product') or ''
+        product_value = str(product_raw).strip() or None
+        type_value_raw = form_payload.get('category') or analysis.get('type') or row_data.get('type') or 'Thread'
+        type_value = str(type_value_raw).strip() or 'Thread'
+        title = form_payload.get('title')
+        if not title:
+            title_parts = [type_value]
+            if product_value and product_value.lower() not in type_value.lower():
+                title_parts.append(product_value)
+            title = ' • '.join([part for part in title_parts if part]) or 'Thread Item'
+
+        rich_text_fields = {
+            'product': product_value,
+            'label': str((form_payload.get('category') or analysis.get('type') or row_data.get('type') or '')).strip() or None,
+            'category': str(form_payload.get('category') or '').strip() or None,
+            'feature': str((form_payload.get('feature') or analysis.get('fitur') or row_data.get('fitur') or '')).strip() or None,
+            'date_of_incident': str(form_payload.get('date_of_incident') or '').strip() or None,
+            'severity': str((analysis.get('severity') or row_data.get('severity') or '')).strip() or None,
+            'urgency': str((analysis.get('urgency') or row_data.get('urgency') or '')).strip() or None,
+            'reporter': str(row_data.get('reporter') or form_payload.get('reporter_display') or '').strip() or None,
+            'responder': str(row_data.get('responder') or '').strip() or None,
+            'sheet_name': str(sheet_name or '').strip() or None,
+            'from_value': str(row_data.get('from') or '').strip() or None,
+            'reporting_date_time': str(row_data.get('reporting_date_time') or '').strip() or None,
+            'response_time': str(row_data.get('response_time') or '').strip() or None,
+            'channel': str(channel or '').strip() or None,
+        }
+
+        description_text = _shorten_text(form_payload.get('description') or row_data.get('description') or analysis.get('description'))
+        if description_text:
+            rich_text_fields['description'] = description_text
+
+        if quarter and year:
+            rich_text_fields['quarter'] = f"{quarter} {year}"
+        elif quarter:
+            rich_text_fields['quarter'] = quarter
+        if week_num is not None:
+            rich_text_fields['week'] = f"Week {week_num}"
+
+        # Remove empty values
+        rich_text_fields = {key: value for key, value in rich_text_fields.items() if value}
+
+        link_payload = None
+        if permalink:
+            link_payload = {
+                'url': permalink,
+                'display_name': os.getenv('SLACK_LIST_LINK_DISPLAY_NAME', 'Slack Thread')
+            }
+
+        status_override = os.getenv('SLACK_LIST_PQF_STATUS_NAME') or os.getenv('SLACK_LIST_PQF_STATUS_KEY')
+
+        attachments = form_payload.get('attachments')
+
+        slack_bot.create_list_item(
+            title=title,
+            rich_text_fields=rich_text_fields,
+            link=link_payload,
+            status_key=status_override,
+            attachments=attachments
+        )
+    except Exception as exc:
+        logger.error(f"Failed to create Slack List item: {str(exc)}")
 
 def validate_and_extract_command(text):
     """
@@ -135,6 +271,9 @@ def handle_app_mention(event):
                 parent = thread_data.get('parent_message', {})
                 parent_ts = parent.get('ts')
                 #parent_text = parent.get('text', '')
+                quarter = None
+                tahun = None
+                week_num = None
                 if parent_ts:
                     dt = datetime.fromtimestamp(float(parent_ts))
                     bulan = dt.month
@@ -149,8 +288,9 @@ def handle_app_mention(event):
                     else:
                         quarter = 'Q4'
                     analysis = gemini_analyzer.analyze_thread(thread_data)
+                    form_payload = extract_workflow_form_data(parent)
                     if analysis:
-                        product_raw = (analysis.get('product') or '').strip().lower()
+                        product_raw = (form_payload.get('product') or analysis.get('product') or '').strip().lower()
                         agentlabs_keywords = ['agentlabs', 'llm', 'intent base']
                         appcenter_keywords = ['shopee', 'email', 'qcrm', 'appcenter', 'survey', 'tokopedia', 'email broadcast']
                         if any(k in product_raw for k in agentlabs_keywords):
@@ -207,35 +347,55 @@ def handle_app_mention(event):
                                 reporter_name = user_info.get('real_name', user_info.get('name', reporter_id))
                             else:
                                 reporter_name = reporter_id
+                        if reporter_name == 'Unknown' and form_payload.get('reporter_display'):
+                            reporter_name = form_payload['reporter_display']
+                        description_value = form_payload.get('description') or analysis.get('description', 'No description')
+                        product_value = form_payload.get('product') or analysis.get('product', 'Unknown')
+                        feature_value = form_payload.get('feature') or analysis.get('fitur', 'Unknown')
                         row_data = {
                             'from': 'Eksternal',
-                            'type': analysis.get('type', 'Unknown'),
-                            'product': analysis.get('product', 'Unknown'),
+                            'type': form_payload.get('category') or analysis.get('type', 'Unknown'),
+                            'product': product_value,
                             'role': '',
-                            'fitur': analysis.get('fitur', 'Unknown'),
+                            'fitur': feature_value,
                             'reporter': reporter_name,
                             'reporting_date_time': reporting_date_time,
                             'responder': responder_name,
-                            'description': analysis.get('description', 'No description'),
+                            'description': description_value,
                             'link': permalink,
                             'response_time': response_time_str,
                             'severity': '',
-                            'urgency': ''
+                            'urgency': '',
+                            'title': form_payload.get('title'),
+                            'date_of_incident': form_payload.get('date_of_incident'),
+                            'form_category': form_payload.get('category')
                         }
                         success = spreadsheet_manager.prepend_row(row_data, sheet_name)
                         if success:
+                            permalink_for_list = permalink
                             import os
                             forward_channel = os.getenv('FORWARD_CHANNEL_ID')
                             if forward_channel:
+                                month_name = dt.strftime('%B')
                                 permalink = thread_data.get('permalink', '')
                                 if '&cid=' in permalink:
                                     permalink = permalink.split('&cid=')[0]
-                                    month_name = dt.strftime('%B')
                                 info_text = f"[{quarter}] [{tahun}] [Week {week_num}] [Date {dt.day} - {month_name}] [Tercatat]"
                                 slack_bot.client.chat_postMessage(
                                     channel=forward_channel,
                                     text=info_text + "\n" + permalink
                                 )
+                            create_slack_list_item_from_row(
+                                row_data=row_data,
+                                analysis=analysis,
+                                sheet_name=sheet_name,
+                                quarter=quarter,
+                                year=tahun,
+                                week_num=week_num,
+                                permalink=permalink_for_list,
+                                channel=channel,
+                                form_payload=form_payload
+                            )
             return
 
         # Jika reply (bukan parent), baru proses pqf dan validasi
@@ -406,8 +566,8 @@ def process_thread_data(thread_data, channel, user, thread_ts, from_value="Inter
                                 if responder_name not in responder_names:
                                     responder_names.append(responder_name)
             # Fallback: if no reply from whitelist, use parent message (mention)
+            parent = thread_data.get('parent_message', {})
             if not found_reply:
-                parent = thread_data.get('parent_message', {})
                 parent_ts = parent.get('ts')
                 if parent_ts:
                     from datetime import datetime
@@ -424,8 +584,11 @@ def process_thread_data(thread_data, channel, user, thread_ts, from_value="Inter
                     dt = datetime.fromtimestamp(float(first_response_ts))
                     response_time = dt.strftime('%Y-%m-%d %H:%M')
             reporting_date_time = ''
-            parent = thread_data.get('parent_message', {})
             parent_ts = parent.get('ts')
+            form_payload = extract_workflow_form_data(parent)
+            quarter = None
+            tahun = None
+            week_num = None
             #parent_text = parent.get('text', '')
             if parent_ts:
                 from datetime import datetime
@@ -443,37 +606,60 @@ def process_thread_data(thread_data, channel, user, thread_ts, from_value="Inter
                 else:
                     quarter = 'Q4'
             responder_name = ', '.join(responder_names) if responder_names else 'Unknown'
+            if reporter_name == 'Unknown' and form_payload.get('reporter_display'):
+                reporter_name = form_payload['reporter_display']
+
+            description_value = form_payload.get('description') or analysis.get('description', 'No description')
+            product_value = form_payload.get('product') or analysis.get('product', 'Unknown')
+            feature_value = form_payload.get('feature') or analysis.get('fitur', 'Unknown')
+            type_value = form_payload.get('category') or analysis.get('type', 'Unknown')
+
             row_data = {
                 'from': from_value,
-                'type': analysis.get('type', 'Unknown'),
-                'product': analysis.get('product', 'Unknown'),
+                'type': type_value,
+                'product': product_value,
                 'role': analysis.get('role', 'Unknown'),
-                'fitur': analysis.get('fitur', 'Unknown'),
+                'fitur': feature_value,
                 'reporter': reporter_name,
                 'reporting_date_time': reporting_date_time,
                 'responder': responder_name,
-                'description': analysis.get('description', 'No description'),
+                'description': description_value,
                 'link': permalink,
                 'response_time': response_time,
                 'severity': analysis.get('severity', 'Others (Ask)'),
-                'urgency': analysis.get('urgency', 'Medium')
+                'urgency': analysis.get('urgency', 'Medium'),
+                'title': form_payload.get('title'),
+                'date_of_incident': form_payload.get('date_of_incident'),
+                'form_category': form_payload.get('category')
             }
             logger.info(f"Attempting to prepend row to sheet: {sheet_name}")
             success = spreadsheet_manager.prepend_row(row_data, sheet_name)
             if success:
                 logger.info(f"Successfully added row to sheet: {sheet_name}")
+                permalink_for_list = permalink
                 import os
                 forward_channel = os.getenv('FORWARD_CHANNEL_ID')
                 if forward_channel and parent_ts:
+                    month_name = dt.strftime('%B')
                     permalink = thread_data.get('permalink', '')
                     if '&cid=' in permalink:
                         permalink = permalink.split('&cid=')[0]
-                        month_name = dt.strftime('%B')
                     info_text = f"[{quarter}] [{tahun}] [Week {week_num}] [Date {dt.day} - {month_name}] [Tercatat]"
                     slack_bot.client.chat_postMessage(
                         channel=forward_channel,
                         text=info_text + "\n" + permalink
                     )
+                create_slack_list_item_from_row(
+                    row_data=row_data,
+                    analysis=analysis,
+                    sheet_name=sheet_name,
+                    quarter=quarter,
+                    year=tahun,
+                    week_num=week_num,
+                    permalink=permalink_for_list,
+                    channel=thread_data.get('channel'),
+                    form_payload=form_payload
+                )
             else:
                 logger.error(f"Failed to add row to sheet: {sheet_name}")
                 slack_bot.send_message(
