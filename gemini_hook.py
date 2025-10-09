@@ -95,7 +95,7 @@ Kembalikan hanya JSON berikut (tanpa penjelasan tambahan):
                 Bug → Ditemukan bug, error, defect, atau malfungsi pada sistem yang harus diperbaiki,
                 Feedback → Masukan untuk peningkatan, saran perbaikan UX, usability, atau usulan perubahan non-critical,
                 Other → Lainnya (jika tidak ada yang sesuai)",
-  "product": "Nama produk (misal: AgentLabs, LLM, Intent Base, Shopee, Email, App Center, Qiscus Survey, atau Unknown jika tidak ada)",
+  "product": "Nama produk (misal: AgentLabs, LLM, Intent Base, Shopee, Email, Dialogflow, App Center, Qiscus Survey, Email Broadcast, Tiktok, Tokopedia, QCRM, CSAT, Agent Copilot atau Unknown jika tidak ada)",
   "fitur" : "Fitur yang di ambil dari hasil analisis thread merupakan fitur yang terkena bug, error, ask ,ataupun feedback",
   "description": "Ringkasan diskusi (maksimal 600 karakter, dalam bahasa Indonesia)",
   "role": "menganalisis deskripsi issue atau thread diskusi di bawah ini, lalu tentukan Role yang paling tepat untuk menangani issue tersebut:

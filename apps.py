@@ -1,46 +1,67 @@
 import os
 import logging
+import json
+import re
+import textwrap
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
-import json
-import re
-import textwrap
-import threading
-import time
-import traceback
-from concurrent.futures import ThreadPoolExecutor
 
-from slack_bot import SlackBot
 from gemini_hook import GeminiAnalyzer
+from slack_bot import SlackBot
 from spreadsheet import SpreadsheetManager
+from spreadsheetbug import SpreadsheetBugManager
 
-# Load environment variables
+
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# Suppress DEBUG logs from slack_sdk
-logging.getLogger("slack_sdk").setLevel(logging.WARNING)
-
-# Initialize Flask app
 app = Flask(__name__)
 
-# Initialize components
 slack_bot = SlackBot()
 gemini_analyzer = GeminiAnalyzer()
 spreadsheet_manager = SpreadsheetManager()
+bug_manager = SpreadsheetBugManager()
+
+
+def _resolve_thread_pool_size() -> int:
+    """Return thread pool size from env or sensible default."""
+    cpu_bound_default = max(2, min(32, (os.cpu_count() or 1) * 5))
+    env_value = os.getenv('THREAD_POOL_MAX_WORKERS')
+    if env_value:
+        try:
+            parsed = int(env_value)
+            if parsed < 1:
+                raise ValueError
+            return parsed
+        except ValueError:
+            logger.warning(
+                "Invalid THREAD_POOL_MAX_WORKERS value '%s'. Falling back to default %s",
+                env_value,
+                cpu_bound_default,
+            )
+    return cpu_bound_default
+
+
+THREAD_POOL_MAX_WORKERS = _resolve_thread_pool_size()
 
 # Inisialisasi ThreadPoolExecutor untuk membatasi worker paralel
-executor = ThreadPoolExecutor(max_workers=2)  # Bisa disesuaikan sesuai kebutuhan
+executor = ThreadPoolExecutor(
+    max_workers=THREAD_POOL_MAX_WORKERS,
+    thread_name_prefix="bot-worker",
+)
+logger.info("ThreadPoolExecutor initialized with %s workers", THREAD_POOL_MAX_WORKERS)
 
-ALLOWED_CHANNELS = os.getenv('ALLOWED_CHANNELS', '').split(',')
+ALLOWED_CHANNELS = [channel.strip() for channel in os.getenv('ALLOWED_CHANNELS', '').split(',') if channel.strip()]
+FORWARD_CHANNEL_IDS = [channel.strip() for channel in os.getenv('FORWARD_CHANNEL_ID', '').split(',') if channel.strip()]
+
 WORKFLOW_BRACKET_FIELD_ORDER = [
     field.strip()
     for field in os.getenv('SLACK_WORKFLOW_BRACKET_FIELD_ORDER', 'date_of_incident,category,product').split(',')
@@ -142,7 +163,11 @@ def create_slack_list_item_from_row(row_data, analysis, sheet_name, quarter=None
             'channel': str(channel or '').strip() or None,
         }
 
-        description_text = _shorten_text(form_payload.get('description') or row_data.get('description') or analysis.get('description'))
+        description_text = _shorten_text(
+            form_payload.get('description')
+            or analysis.get('description')
+            or row_data.get('description')
+        )
         if description_text:
             rich_text_fields['description'] = description_text
 
@@ -187,43 +212,30 @@ def validate_and_extract_command(text):
     """
     # Remove bot mention and clean text
     text = re.sub(r'<@[^>]+>', '', text).strip().lower()
-    
+
     # Define validation patterns
     valid_froms = ['internal', 'eksternal']
-    valid_quarters = ['q1', 'q2', 'q3', 'q4']
     valid_products = ['agentlabs', 'appcenter']
-    
-    # Pattern to match the command format
-    pattern = r'^(internal|eksternal)\s+pqf\s+(q[1-4])\s+(\d{4})\s+(agentlabs|appcenter)$'
-    match = re.match(pattern, text)
-    
-    if not match:
+
+    # Flexible pattern: find all required keywords in any order
+    from_match = re.search(r'(internal|eksternal)', text)
+    pqf_match = re.search(r'pqf', text)
+    product_match = re.search(r'(agentlabs|appcenter)', text)
+
+    if not (from_match and pqf_match and product_match):
         return None, None, "Format perintah tidak valid"
-    
-    from_value = match.group(1)
-    quarter = match.group(2)
-    year = match.group(3)
-    product = match.group(4)
-    
+
+    from_value = from_match.group(1)
+    product = product_match.group(1)
+
     # Additional validations
     if from_value not in valid_froms:
         return None, None, f"From harus 'internal' atau 'eksternal', bukan '{from_value}'"
-    
-    if quarter not in valid_quarters:
-        return None, None, f"Quarter harus 'q1', 'q2', 'q3', atau 'q4', bukan '{quarter}'"
-    
-    # Validate year (reasonable range)
-    year_int = int(year)
-    if year_int < 2020 or year_int > 2030:
-        return None, None, f"Tahun harus antara 2020-2030, bukan '{year}'"
-    
+
     if product not in valid_products:
         return None, None, f"Product harus 'agentlabs' atau 'appcenter', bukan '{product}'"
-    
-    # Create sheet name
-    sheet_name = f"{quarter.upper()} {year} {product.capitalize()}"
-    
-    return from_value.capitalize(), sheet_name, None
+
+    return from_value.capitalize(), product.capitalize(), None
 
 @app.route('/slack/events', methods=['POST'])
 def slack_events():
@@ -291,8 +303,8 @@ def handle_app_mention(event):
                     form_payload = extract_workflow_form_data(parent)
                     if analysis:
                         product_raw = (form_payload.get('product') or analysis.get('product') or '').strip().lower()
-                        agentlabs_keywords = ['agentlabs', 'llm', 'intent base']
-                        appcenter_keywords = ['shopee', 'email', 'qcrm', 'appcenter', 'survey', 'tokopedia', 'email broadcast']
+                        agentlabs_keywords = ['agentlabs', 'llm', 'intent base', 'dialogflow']
+                        appcenter_keywords = ['shopee', 'email', 'qcrm', 'appcenter', 'survey', 'tokopedia', 'email broadcast', 'tiktok', 'csat', 'agent copilot']
                         if any(k in product_raw for k in agentlabs_keywords):
                             product_sheet = 'Agentlabs'
                         elif any(k in product_raw for k in appcenter_keywords):
@@ -401,23 +413,23 @@ def handle_app_mention(event):
         # Jika reply (bukan parent), baru proses pqf dan validasi
         text_lower = text.lower()
         if 'pqf' in text_lower:
-            from_value, sheet_name, error_message = validate_and_extract_command(text)
+            if FORWARD_CHANNEL_IDS and channel not in FORWARD_CHANNEL_IDS:
+                slack_bot.send_message(
+                    channel,
+                    "Saat ini bot tidak dapat menindaklanjuti issue melalui kolom komentar. Informasi terkait bug/issue/feedback tersebut sudah kami terima dan sedang diproses oleh tim kami. Pembaruan dan respon akan disampaikan oleh tim kami setelah ada perkembangan lebih lanjut. Terimakasih.",
+                    thread_ts=ts
+                )
+                return
+            from_value, product, error_message = validate_and_extract_command(text)
             if error_message:
                 help_message = """
                 Saat ini bot tidak dapat menindaklanjuti issue melalui kolom komentar. Informasi terkait bug/issue/feedback tersebut sudah kami terima dan sedang diproses oleh tim kami. Pembaruan dan respon akan disampaikan oleh tim kami setelah ada perkembangan lebih lanjut. Terimakasih.
                 """
                 slack_bot.send_message(channel, help_message, thread_ts=ts)
                 return
-            if from_value is None or sheet_name is None:
-                slack_bot.send_message(channel, f"<@{user}> ❌ Terjadi kesalahan dalam memproses perintah.", thread_ts=ts)
+            if from_value is None or product is None:
+                logger.info(f" Terjadi kesalahan dalam memproses perintah. {ts}")
                 return
-            logger.info(f"Command parsed - From: {from_value}, Sheet: {sheet_name}")
-            available_sheets = spreadsheet_manager.get_available_sheets()
-            logger.info(f"Available sheets: {available_sheets}")
-            spreadsheet_manager.create_sheet_if_not_exists(sheet_name)
-            logger.info(f"Preparing to insert to sheet: {sheet_name}")
-            import time
-            time.sleep(1)
 
             # --- Ambil thread_data dari thread asli jika event terjadi di channel forward ---
             def parse_slack_permalink(permalink):
@@ -456,6 +468,25 @@ def handle_app_mention(event):
             # --- END ---
 
             if thread_data:
+                # Ambil quarter dan year dari reporting_date_time (parent_ts)
+                parent = thread_data.get('parent_message', {})
+                parent_ts = parent.get('ts')
+                if parent_ts:
+                    from datetime import datetime
+                    dt = datetime.fromtimestamp(float(parent_ts))
+                    bulan = dt.month
+                    tahun = dt.year
+                    if 1 <= bulan <= 3:
+                        quarter = 'Q1'
+                    elif 4 <= bulan <= 6:
+                        quarter = 'Q2'
+                    elif 7 <= bulan <= 9:
+                        quarter = 'Q3'
+                    else:
+                        quarter = 'Q4'
+                    sheet_name = f"{quarter} {tahun} {product}"
+                else:
+                    sheet_name = f"Thread Analysis"
                 permalink = thread_data.get('permalink', '')
                 if '&cid=' in permalink:
                     permalink = permalink.split('&cid=')[0]
@@ -468,11 +499,11 @@ def handle_app_mention(event):
                     )
                 else:
                     executor.submit(process_thread_data, thread_data, channel, user, ts, from_value, sheet_name)
-                    # slack_bot.send_message(
-                    #     channel,
-                    #     f"Laporanmu sudah masuk ke list PQF di sheet {sheet_name} untuk proses tindak lanjut, ya QFolks!",
-                    #     thread_ts=ts
-                    # )
+                    slack_bot.send_message(
+                        channel,
+                        f"✅ Sudah masuk ke List PQF",
+                        thread_ts=ts
+                    )
             else:
                 slack_bot.send_message(
                     channel, 
@@ -502,7 +533,7 @@ def handle_app_mention(event):
             """
             slack_bot.send_message(channel, help_message, thread_ts=ts)
     except Exception as e:
-        logger.error(f"Gagal catat, silakan catat manual boss: {str(e)}")
+        logger.error(f"Gagal catat ke list PQF, silakan catat manual boss: {str(e)}")
         help_message = """
             Saat ini bot tidak dapat menindaklanjuti issue melalui kolom komentar. Informasi terkait bug/issue/feedback tersebut sudah kami terima dan sedang diproses oleh tim kami. Pembaruan dan respon akan disampaikan oleh tim kami setelah ada perkembangan lebih lanjut. Terimakasih.
             """
@@ -512,7 +543,6 @@ def process_thread_data(thread_data, channel, user, thread_ts, from_value="Inter
     """Process thread data with Gemini AI and save to spreadsheet"""
     try:
         # Always initialize ts with thread_ts (from mention)
-        ts = thread_ts
         permalink = thread_data.get('permalink', '')
         if '&cid=' in permalink:
             permalink = permalink.split('&cid=')[0]
@@ -552,7 +582,6 @@ def process_thread_data(thread_data, channel, user, thread_ts, from_value="Inter
                                 reply_ts = reply.get('ts')
                                 if reply_ts and (first_response_ts is None or float(reply_ts) < float(first_response_ts)):
                                     first_response_ts = reply_ts
-                                    ts = reply_ts  # Overwrite ts ONLY if found
                                     found_reply = True
                 for reply in thread_data['replies']:
                     user_id = reply.get('user')
@@ -594,17 +623,6 @@ def process_thread_data(thread_data, channel, user, thread_ts, from_value="Inter
                 from datetime import datetime
                 dt = datetime.fromtimestamp(float(parent_ts))
                 reporting_date_time = dt.strftime('%Y-%m-%d %H:%M')
-                bulan = dt.month
-                tahun = dt.year
-                week_num = ((dt.day - 1) // 7) + 1
-                if 1 <= bulan <= 3:
-                    quarter = 'Q1'
-                elif 4 <= bulan <= 6:
-                    quarter = 'Q2'
-                elif 7 <= bulan <= 9:
-                    quarter = 'Q3'
-                else:
-                    quarter = 'Q4'
             responder_name = ', '.join(responder_names) if responder_names else 'Unknown'
             if reporter_name == 'Unknown' and form_payload.get('reporter_display'):
                 reporter_name = form_payload['reporter_display']
@@ -818,6 +836,8 @@ def process_ticket_command(channel, thread_ts=None):
     logger.info(f"process_ticket_command: WAJIB ambil thread_data dari thread asli: channel={channel_real}, thread_ts={thread_ts_real}")
     thread_data = slack_bot.get_thread_data(channel_real, thread_ts_real)
     parent = thread_data.get('parent_message', {}) if thread_data else {}
+    channel_asli = channel  # simpan channel forward
+    thread_ts_asli = thread_ts  # simpan thread_ts forward
     channel = channel_real
     thread_ts = thread_ts_real
 
@@ -892,7 +912,31 @@ def process_ticket_command(channel, thread_ts=None):
             'note': ''
         }
         try:
-            bug_manager.prepend_row_bug(row_data, sheet_name)
+            is_new_row = bug_manager.prepend_row_bug(row_data, sheet_name)
+            # Jika duplicate (is_new_row == False), skip update related ticket
+            if is_new_row:
+                # Tambahan: update kolom Related Ticket pada spreadsheet utama
+                code_value = code_str
+                link_message = permalink
+                from spreadsheet import SpreadsheetManager
+                spreadsheet_manager = SpreadsheetManager()
+                found = False
+                for sheet in spreadsheet_manager.get_available_sheets():
+                    links = [l.split('&cid=')[0] if l else l for l in spreadsheet_manager.get_all_links(sheet)]
+                    if link_message in links:
+                        updated = spreadsheet_manager.update_column_by_link(sheet, link_message, 'Related Ticket', code_value)
+                        if updated:
+                            logger.info(f"Berhasil update kolom Related Ticket pada sheet {sheet} untuk link {link_message} dengan value {code_value}")
+                        else:
+                            logger.error(f"Gagal update kolom Related Ticket pada sheet {sheet} untuk link {link_message}")
+                        found = True
+                        break
+                if not found:
+                    logger.info(f"Tidak ditemukan sheet yang mengandung link message {link_message} untuk update kolom Related Ticket")
+                # Kirim response ke thread forward (bukan thread asli)
+                slack_bot.send_message(channel_asli, f"✅ Ticketmu sudah tercatat di bug tracking dengan kode: {code_str}", thread_ts=thread_ts_asli)
+            else:
+                logger.info("Duplicate bug detected, skipping update of Related Ticket column.")
         except Exception as e:
             logger.error(f"Error mencatat bug: {str(e)}")
             slack_bot.send_message(channel, f"Gagal mencatat bug: {str(e)}", thread_ts=thread_ts)
