@@ -135,48 +135,51 @@ def create_slack_list_item_from_row(row_data, analysis, sheet_name, quarter=None
     try:
         analysis = analysis or {}
         form_payload = form_payload or {}
-        product_raw = form_payload.get('product') or analysis.get('product') or row_data.get('product') or ''
-        product_value = str(product_raw).strip() or None
-        type_value_raw = form_payload.get('category') or analysis.get('type') or row_data.get('type') or 'Thread'
-        type_value = str(type_value_raw).strip() or 'Thread'
-        title = form_payload.get('title')
-        if not title:
-            title_parts = [type_value]
-            if product_value and product_value.lower() not in type_value.lower():
-                title_parts.append(product_value)
-            title = ' • '.join([part for part in title_parts if part]) or 'Thread Item'
 
-        rich_text_fields = {
-            'product': product_value,
-            'label': str((form_payload.get('category') or analysis.get('type') or row_data.get('type') or '')).strip() or None,
-            'category': str(form_payload.get('category') or '').strip() or None,
-            'feature': str((form_payload.get('feature') or analysis.get('fitur') or row_data.get('fitur') or '')).strip() or None,
-            'date_of_incident': str(form_payload.get('date_of_incident') or '').strip() or None,
-            'severity': str((analysis.get('severity') or row_data.get('severity') or '')).strip() or None,
-            'urgency': str((analysis.get('urgency') or row_data.get('urgency') or '')).strip() or None,
-            'reporter': str(row_data.get('reporter') or form_payload.get('reporter_display') or '').strip() or None,
-            'responder': str(row_data.get('responder') or '').strip() or None,
-            'sheet_name': str(sheet_name or '').strip() or None,
-            'from_value': str(row_data.get('from') or '').strip() or None,
-            'reporting_date_time': str(row_data.get('reporting_date_time') or '').strip() or None,
-            'response_time': str(row_data.get('response_time') or '').strip() or None,
-            'channel': str(channel or '').strip() or None,
-        }
+        title_candidates = [
+            form_payload.get('title'),
+            row_data.get('title'),
+            analysis.get('title'),
+        ]
+        title = next((str(value).strip() for value in title_candidates if value), None)
+        if not title:
+            fallback_parts = [
+                str(form_payload.get('category') or analysis.get('type') or row_data.get('type') or '').strip(),
+                str(form_payload.get('product') or analysis.get('product') or row_data.get('product') or '').strip(),
+            ]
+            title = ' • '.join([part for part in fallback_parts if part]) or 'Thread Item'
+
+        severity_value = str(
+            analysis.get('severity')
+            or row_data.get('severity')
+            or ''
+        ).strip()
 
         description_text = _shorten_text(
             form_payload.get('description')
             or analysis.get('description')
             or row_data.get('description')
         )
-        if description_text:
-            rich_text_fields['description'] = description_text
 
-        if quarter and year:
-            rich_text_fields['quarter'] = f"{quarter} {year}"
-        elif quarter:
-            rich_text_fields['quarter'] = quarter
-        if week_num is not None:
-            rich_text_fields['week'] = f"Week {week_num}"
+        submitted_by = str(
+            form_payload.get('reporter_display')
+            or row_data.get('reporter')
+            or analysis.get('reporter')
+            or ''
+        ).strip()
+
+        date_submitted = str(
+            row_data.get('reporting_date_time')
+            or form_payload.get('date_of_incident')
+            or ''
+        ).strip()
+
+        rich_text_fields = {
+            'severity': severity_value or None,
+            'description': description_text or None,
+            'reporter': submitted_by or None,
+            'reporting_date_time': date_submitted or None,
+        }
 
         # Remove empty values
         rich_text_fields = {key: value for key, value in rich_text_fields.items() if value}
@@ -188,16 +191,17 @@ def create_slack_list_item_from_row(row_data, analysis, sheet_name, quarter=None
                 'display_name': os.getenv('SLACK_LIST_LINK_DISPLAY_NAME', 'Slack Thread')
             }
 
-        status_override = os.getenv('SLACK_LIST_PQF_STATUS_NAME') or os.getenv('SLACK_LIST_PQF_STATUS_KEY')
-
-        attachments = form_payload.get('attachments')
+        status_override = (
+            os.getenv('SLACK_LIST_PQF_STATUS_NAME')
+            or os.getenv('SLACK_LIST_PQF_STATUS_KEY')
+            or 'New'
+        )
 
         slack_bot.create_list_item(
             title=title,
             rich_text_fields=rich_text_fields,
             link=link_payload,
-            status_key=status_override,
-            attachments=attachments
+            status_key=status_override
         )
     except Exception as exc:
         logger.error(f"Failed to create Slack List item: {str(exc)}")
