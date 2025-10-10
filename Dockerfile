@@ -18,5 +18,5 @@ COPY . .
 # Railway injects PORT; default to 3000 for local runs
 ENV PORT=3000
 
-# Use gunicorn to serve the Flask app
-CMD ["sh", "-c", "gunicorn -w ${WEB_CONCURRENCY:-4} -b 0.0.0.0:${PORT:-3000} apps:app"]
+# Use a single gunicorn worker; background thread pool handles async work
+CMD ["sh", "-c", "gunicorn -w 1 -b 0.0.0.0:${PORT:-3000} apps:app"]
